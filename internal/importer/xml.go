@@ -50,6 +50,8 @@ type XMLImporter struct {
 	sheetNames []string
 
 	prefixMaps map[string](map[string]Range) // sheet -> { prefix -> [6, 9) }
+
+	xml *tableaupb.XML
 }
 
 // TODO: options
@@ -58,6 +60,7 @@ func NewXMLImporter(filename string, sheets []string) (*XMLImporter, error) {
 		filename:   filename,
 		sheetNames: sheets,
 		prefixMaps: make(map[string](map[string]Range)),
+		xml: &tableaupb.XML{},
 	}, nil
 }
 
@@ -105,6 +108,8 @@ func (x *XMLImporter) GetSheet(name string) *book.Sheet {
 func (x *XMLImporter) parse() error {
 	x.sheetMap = make(map[string]*book.Sheet)
 	x.metaMap = make(map[string]*xlsxgen.MetaSheet)
+	x.xml.Name = x.BookName()
+	x.xml.Sheets = make(map[string]*tableaupb.Sheet)
 	// open xml file and parse the document
 	xmlPath := x.filename
 	atom.Log.Debugf("xml: %s", xmlPath)
@@ -163,14 +168,28 @@ func (x *XMLImporter) parse() error {
 					x.sheetNames = append(x.sheetNames, nav.LocalName())
 				}
 				hasTableauSheets = true
-				if err := x.parseSheet(nav.Current(), nav.LocalName(), firstPass); err != nil {
+				if _, existed := x.xml.Sheets[nav.LocalName()]; !existed {
+					x.xml.Sheets[nav.LocalName()] = &tableaupb.Sheet{
+						Name: nav.LocalName(),
+						Meta: &tableaupb.Node{},
+						Root: &tableaupb.Node{},
+					}
+				}
+				if err := x.parseNode(nav.Current(), x.xml.Sheets[nav.LocalName()].Meta); err != nil {
 					return errors.WithMessagef(err, "failed to parse `@%s` sheet: %s#%s", metaName, x.filename, nav.LocalName())
 				}
 			}
 		} else {
 			// parse sheets
 			if (!hasUserSheets && !hasTableauSheets) || contains(x.sheetNames, n.Data) {
-				if err := x.parseSheet(n, n.Data, firstPass); err != nil {
+				if _, existed := x.xml.Sheets[n.Data]; !existed {
+					x.xml.Sheets[n.Data] = &tableaupb.Sheet{
+						Name: n.Data,
+						Meta: &tableaupb.Node{},
+						Root: &tableaupb.Node{},
+					}
+				}
+				if err := x.parseNode(n, x.xml.Sheets[n.Data].Root); err != nil {
 					return errors.WithMessagef(err, "failed to parse sheet: %s#%s", x.filename, n.Data)
 				}
 				if !hasUserSheets && !hasTableauSheets {
@@ -183,6 +202,12 @@ func (x *XMLImporter) parse() error {
 			atom.Log.Debugf("`<@TABLEAU>...</@TABLEAU>` not exists or not the first sheet")
 			x.sheetNames = nil
 			return nil
+		}
+	}
+
+	for _, s := range x.xml.Sheets {
+		if err := x.preprocess(s.Meta, s.Root); err != nil {
+			return errors.WithMessagef(err, "failed to preprocess")
 		}
 	}
 
@@ -207,6 +232,50 @@ func (x *XMLImporter) parse() error {
 		}
 	}
 
+	return nil
+}
+
+func (x *XMLImporter) preprocess(meta *tableaupb.Node, root *tableaupb.Node) error {
+	if meta.Name != root.Name {
+		panic("name not equal")
+	}
+	for attrName, attrValue := range root.Attrs {
+		if _, existed := meta.Attrs[attrName]; !existed {
+			meta.Attrs[attrName], _ = inferType(attrValue)
+		}
+	}
+	// make index map
+	nodeMap := make(map[string]*tableaupb.Node)
+	for _, n := range meta.Children {
+		nodeMap[n.Name] = n
+	}
+	for _, n := range root.Children {
+		if err := x.preprocess(nodeMap[n.Name], n); err != nil {
+			return errors.WithMessagef(err, "failed to preprocess")
+		}
+	}
+	return nil
+}
+
+func (x *XMLImporter) parseNode(doc *xmlquery.Node, n *tableaupb.Node) error {
+	root := xmlquery.CreateXPathNavigator(doc)
+	n.Name = root.LocalName()
+	n.Attrs = make(map[string]string)
+	// iterate over attributes
+	for _, attr := range root.Current().Attr {
+		n.Attrs[attr.Name.Local] = attr.Value
+	}
+	for flag := root.MoveToChild(); flag; flag = root.MoveToNext() {
+		// commentNode, documentNode and other meaningless nodes should be filtered
+		if root.NodeType() != xpath.ElementNode {
+			continue
+		}
+		newNode := &tableaupb.Node{}
+		if err := x.parseNode(root.Current(), newNode); err != nil {
+			return errors.WithMessagef(err, "failed to parse node")
+		}
+		n.Children = append(n.Children, newNode)
+	}
 	return nil
 }
 

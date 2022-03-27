@@ -1,0 +1,20 @@
+syntax = "proto3";
+package tableau;
+option go_package = "github.com/tableauio/tableau/proto/tableaupb";
+
+message XML {
+  map<string, Sheet> sheets = 1;
+  string name = 2;
+}
+
+message Sheet {
+  Node meta = 1;
+  Node root = 2;
+  string name = 3;
+}
+
+message Node {
+  string name = 1;
+  map<string, string> attrs = 2;
+  repeated Node children = 3;
+}
